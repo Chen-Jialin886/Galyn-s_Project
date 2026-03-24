@@ -126,33 +126,158 @@ def load_excel_to_database(file_path):
     3. 数据加载(Load) - 写入数据库
     """
     # 读取原始数据
-    df = pd.read_excel(file_path)
-    
-    # 数据清洗
-    df_clean = clean_raw_data(df)
-    
-    # 数据库连接
-    conn = pymysql.connect(host="localhost", user="root", 
-                          password="your_password", database="economic_db")
-    
-    # 批量插入数据
-    with conn.cursor() as cursor:
-        for _, row in df_clean.iterrows():
-            sql = """
-                INSERT INTO economic_data 
-                (province, year, indicator, value, area_type)
-                VALUES (%s, %s, %s, %s, %s)
+
+for index, row in df.iterrows():
+    # 清理数据
+    province = str(row["province"]).strip()
+    year = int(row["year"])
+    indicator = str(row["indicator"]).strip()
+    value = float(row["value"])
+    area_type = str(row["area_type"]).strip()
+
+    # ===============================
+    # 1️⃣ 时间维度（年份必须在 dim_time 中）
+    # ===============================
+    cursor.execute("SELECT time_id FROM dim_time WHERE year = %s", (year,))
+    result = cursor.fetchone()
+    if not result:
+        print(f"警告：年份 {year} 不在 dim_time 中，跳过该行")
+        continue
+    time_id = result[0]
+
+    # ===============================
+    # 2️⃣ 省份维度（不存在则自动插入，并生成唯一代码）
+    # ===============================
+    cursor.execute(
+        "SELECT province_id FROM dim_province WHERE province_name = %s", (province,)
+    )
+    result = cursor.fetchone()
+    if not result:
+        # 生成唯一省份代码（使用两位数序号，如 01、02……）
+        if province in province_code_map:
+            code = province_code_map[province]
+        else:
+            code = f"{province_code_counter:02d}"
+            province_code_map[province] = code
+            province_code_counter += 1
+        cursor.execute(
+            "INSERT INTO dim_province (province_name, province_code, region) VALUES (%s, %s, %s)",
+            (province, code, "未知"),
+        )
+        conn.commit()
+        province_id = cursor.lastrowid
+        print(f"新增省份：{province}，代码 {code}")
+    else:
+        province_id = result[0]
+
+    # ===============================
+    # 3️⃣ 城乡类型维度（处理“全体”映射为“全国”）
+    # ===============================
+    if area_type == "全体":
+        area_type = "全国"
+    cursor.execute(
+        "SELECT region_type_id FROM dim_region_type WHERE region_category = %s",
+        (area_type,),
+    )
+    result = cursor.fetchone()
+    if not result:
+        print(f"警告：区域类型 {area_type} 不存在，跳过该行")
+        continue
+    region_type_id = result[0]
+
+    # ===============================
+    # 4️⃣ 指标维度（不存在则自动插入）
+    # ===============================
+    cursor.execute(
+        "SELECT indicator_id FROM dim_indicator WHERE indicator_name = %s", (indicator,)
+    )
+    result = cursor.fetchone()
+    if not result:
+        # 简单分类函数（可根据需要扩展）
+        if "收入" in indicator and not ("比上年增长" in indicator):
+            category = "收入"
+            data_type = "金额"
+        elif "支出" in indicator or "消费" in indicator:
+            category = "消费"
+            data_type = "金额"
+        elif "价格指数" in indicator or "CPI" in indicator:
+            category = "价格指数"
+            data_type = "指数"
+        elif "人口" in indicator or "普查" in indicator:
+            category = "人口"
+            data_type = "数量"
+        elif (
+            "GDP" in indicator.upper()
+            or "增加值" in indicator
+            or "国民总收入" in indicator
+        ):
+            category = "宏观经济"
+            data_type = "金额"
+        elif "恩格尔" in indicator or "基尼" in indicator:
+            category = "综合指标"
+            data_type = "比率"
+        elif "比上年增长" in indicator:
+            category = "增长率"
+            data_type = "百分比"
+        elif "平均每百户" in indicator:
+            category = "耐用消费品"
+            data_type = "数量"
+        else:
+            category = "其他"
+            data_type = "数量"
+
+        cursor.execute(
             """
-            cursor.execute(sql, (row['province'], row['year'], 
-                               row['indicator'], row['value'], row['area_type']))
-    
-    conn.commit()
-    conn.close()
-    print(f"✅ 成功导入 {len(df_clean)} 条数据")
+            INSERT INTO dim_indicator
+            (indicator_code, indicator_name, category, unit, data_type, level)
+            VALUES (%s, %s, %s, %s, %s, 1)
+        """,
+            (
+                indicator[:20],  # 取前20字符作为临时 code（可改进）
+                indicator,
+                category,
+                "",  # 单位留空，后续可手动补充
+                data_type,
+            ),
+        )
+        conn.commit()
+        indicator_id = cursor.lastrowid
+        print(f"新增指标：{indicator}")
+    else:
+        indicator_id = result[0]
+
+    # ===============================
+    # 5️⃣ 写入事实表（统一写入 fact_resident）
+    # ===============================
+    try:
+        cursor.execute(
+            """
+            INSERT INTO fact_resident
+            (time_id, province_id, region_type_id, indicator_id, value)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE value = VALUES(value)
+        """,
+            (time_id, province_id, region_type_id, indicator_id, value),
+        )
+    except Exception as e:
+        print(f"插入失败：{e}，数据：{row.to_dict()}")
+        conn.rollback()
+        continue
+
+    # 每1000行提交一次，避免事务过大
+    if (index + 1) % 1000 == 0:
+        conn.commit()
+        print(f"已处理 {index + 1} 行...")
+
+# 最后提交剩余数据
+conn.commit()
+cursor.close()
+conn.close()
+print("✅ 所有数据导入完成！")
 
 ```
 
-核心API接口
+核心API接口示例
 ```python
 # views.py
 from django.http import JsonResponse
